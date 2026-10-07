@@ -55,15 +55,17 @@ Tap **Substrate map** in the arena bar. Or open `/?view=map` directly, or `/?art
   - Claimed zones take the owner's colour, brighter for richer zones and fuller integrity.
   - Duds, hazards and collapsed zones are marked faintly.
   - Small dots = bot probes this tick.
-  - Thin gutters separate the 5×5 arenas, and your arena is outlined in cyan.
+  - Inside an arena the 10×10 squares touch edge to edge. Only a thin break (about 1.5 px on a phone, 7 px in the 2048 export) separates the 5×5 arenas, and your arena is outlined in your colour.
+  - Cell sizes are whole device pixels, and the canvas backing store matches the screen's `devicePixelRatio`, so the 50×50 stays crisp with no blurry seams. The same layout is used in Text-off mode and the export.
   - At round end every map is revealed.
-- **Fairness:** your own arena only shows *your* readings while the round is live. The other arenas show every scout's readings combined.
+- **Fairness:** while you're live in your own arena, the heat there is only *your* readings. Public information still shows: every seat's claims in their colours, duds, hazards, collapses, this tick's probe dots, and a neutral grey trail of where the other seats have probed (where, never what). Once you're out, while spectating, and at reveal, everything shows. The other arenas always show every scout's readings combined.
 - **Tap any arena** to watch it (read-only). From there you can join it or go back to yours. The leaderboard covers all 100 seats.
 - **Controls:**
   - ❚❚ / 1× / 2× / 4×: pause and speed.
   - **Labels:** arena ids, your outline and the export caption.
   - **Text off:** full-screen clean piece with no UI at all. Tap or press Esc to exit.
   - **Background:** 5 presets plus a custom colour picker.
+  - **Colors** (collapsible) lets you recolour probe heat (default: spectrum), your squares, seat 1–4 in every arena (default: each bot's own colour), unexplored cells, dud markers, hazard markers, and the arena dividers (default: background). Each takes a preset swatch or the native colour picker. There's a *Reset to default* button. Choices are saved in `localStorage` (`substrate.colors`) and apply to the map, Text-off, Save image, the leaderboard dots and the arena view's seat colours.
   - **Save image:** exports a 2048×2048 PNG. It uses the Android share sheet when the browser supports sharing files, otherwise it downloads.
 
 Rendering: the simulation runs separately from drawing. The canvas only redraws when something changed, via `requestAnimationFrame`, and cells are batched by colour into one path per colour.
@@ -98,6 +100,9 @@ substrate.nextRound()         // during the reveal: start the next round now
 substrate.setClock({ running: true, speed: 4 })
 substrate.view('map' | 'arena' | 'clean', arenaId?)
 substrate.setBackground('#0d1330')
+substrate.setColors({ heat: '#3ee6ff', you: '#ffe14d', seats: ['#ff6b4a', null, null, null], base: '#1a1033',
+                      dud: '#8a9a96', hazard: '#ffffff', divider: '#000000' })   // null = default; returns the palette
+substrate.resetColors()
 substrate.saveImage()         // same as the Save image button
 substrate.bench(), substrate.perf()   // timing probes
 ```
@@ -123,7 +128,7 @@ Every action returns `{ ok, message, range?, harvested?, event? }` (`event` is `
 
 - `src/game.ts`: one arena (`Game`). The hidden map, commit, seats, actions and house AI. Pure TypeScript, no DOM. `new Game(seed)` is still the original single table.
 - `src/world.ts`: `World` with 25 arenas, the roster, the shared clock and rounds, seat replacement, leaderboard, and arena/global coordinate helpers (`globalCell(row, col, x, y)` → 50×50).
-- `src/overview.ts`: the canvas renderer and PNG export.
+- `src/overview.ts`: the canvas renderer and PNG export. It holds the integer layout (`computeLayout`, `fitPx`, `cellRect`, `hitArena`), the `Palette`, and `cellVisual()`, a pure function deciding how each cell looks, including the own-arena fairness rule.
 - `src/main.ts`: the UI.
 
 Both `Game` and `World` can run server-side when plays become paid.
@@ -141,7 +146,8 @@ The core rules are in `src/game.ts`, which is pure TypeScript with no DOM. The s
 ```bash
 npm install
 npm run dev      # local dev server
-npm test         # vitest: map/commit/probe/claim/replay + 25-arena world, rounds, seats, 50x50 mapping, records
+npm test         # vitest: map/commit/probe/claim/replay + 25-arena world, rounds, seats, 50x50 mapping, records,
+                 # tight integer layout, palette, own-arena visibility
 npm run build    # outputs dist/
 ```
 

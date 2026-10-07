@@ -1,7 +1,10 @@
 import './style.css';
-import { CONFIG, YOU, YOU_COLOR, idx, zoneLabel, signalWord, tickYield, type ActionKind, type Game, type Seat } from './game';
+import { CONFIG, YOU, idx, zoneLabel, signalWord, tickYield, type ActionKind, type Game, type Seat } from './game';
 import { World, ARENA_COUNT, HOME_ARENA, arenaId, arenaIndex, type StepEvent } from './world';
-import { computeLayout, drawOverview, hitArena, renderPng, heatHue, type Layout } from './overview';
+import {
+  computeLayout, drawOverview, hitArena, renderPng, heatHue, fitPx, sanitizePalette, seatColorIn, DEFAULT_PALETTE,
+  type Layout, type Palette,
+} from './overview';
 import { randomSeed } from './rng';
 import { loadScores, saveScore, qualifies, loadHandle, saveHandle } from './scores';
 
@@ -110,6 +113,15 @@ app.innerHTML = `
       ${BG_PRESETS.map((p) => `<button type="button" class="swatch" data-bg="${p.color}" style="--sw:${p.color}" aria-label="${p.name}" title="${p.name}"></button>`).join('')}
       <label class="swatch custom" title="custom colour" aria-label="custom colour"><input type="color" id="ov-bgc" value="#040908" /></label>
     </div>
+    <details class="ov-colors" id="ov-colors">
+      <summary><span>Colors</span><span class="cdots" id="ct-dots"></span></summary>
+      <div class="ct" id="ct-targets" role="group" aria-label="What to recolour"></div>
+      <div class="cp" id="ct-palette" role="group" aria-label="Colour"></div>
+      <div class="cr">
+        <span class="muted" id="ct-hint"></span>
+        <button type="button" class="chip" id="ct-reset">Reset to default</button>
+      </div>
+    </details>
     <div class="ov-note" id="ov-note"></div>
     <div class="lb">
       <h3>Leaderboard <span>· all 100 seats</span></h3>
@@ -117,7 +129,7 @@ app.innerHTML = `
       <div id="lb-you" class="lb-you"></div>
     </div>
     <div class="ov-key">
-      <span><i style="background:${YOU_COLOR}"></i>your zones</span>
+      <span><i id="key-you"></i>your zones</span>
       <span><i class="k-heat"></i>probe heat</span>
       <span><i class="k-own"></i>claimed (brighter = richer, fuller integrity)</span>
       <span><i class="k-dud"></i>dud / collapsed</span>
@@ -192,6 +204,14 @@ type Speed = 1 | 2 | 4;
 const prefs = loadPrefs();
 const clock = { running: true, speed: prefs.speed as Speed, acc: 0, last: 0 };
 const art = { bg: prefs.bg, labels: prefs.labels };
+let pal: Palette = loadPalette();
+
+function loadPalette(): Palette {
+  try { return sanitizePalette(JSON.parse(localStorage.getItem('substrate.colors') ?? '{}')); } catch { return sanitizePalette({}); }
+}
+function savePalette() {
+  try { localStorage.setItem('substrate.colors', JSON.stringify(pal)); } catch { /* ignore */ }
+}
 
 function loadPrefs(): { bg: string; speed: number; labels: boolean } {
   const d = { bg: BG_PRESETS[0].color, speed: 1, labels: true };
@@ -224,7 +244,7 @@ const hasProgress = () => {
   const s = youSeat();
   return !!s && world.phase === 'play' && (s.probesUsed > 0 || s.claimsMade > 0);
 };
-function seatColor(g: Game, id: string | null) { return g.seat(id)?.color ?? '#888'; }
+function seatColor(g: Game, id: string | null) { return seatColorIn(g, id, pal); }
 function seatName(g: Game, id: string | null) { return g.seat(id)?.name ?? 'someone'; }
 function escapeHtml(s: string) {
   return s.replace(/[&<>"']/g, (ch) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[ch]!));
@@ -430,7 +450,7 @@ function renderArena() {
   rv.style.setProperty('--n', String(shown.length));
   rv.classList.toggle('four', shown.length >= 4);
   rv.innerHTML = shown
-    .map((r) => `<div class="rival" style="--c:${r.color}" title="${escapeHtml(r.name)} (${r.kind}${r.kind === 'house' ? `, ${r.family}` : ''})"><i></i><span class="rn">${escapeHtml(r.name)}${r.kind !== 'house' ? `<em>${r.id === YOU ? 'you' : r.kind}</em>` : ''}</span><span class="rs">${Math.floor(r.score)}</span></div>`)
+    .map((r) => `<div class="rival" style="--c:${seatColor(g, r.id)}" title="${escapeHtml(r.name)} (${r.kind}${r.kind === 'house' ? `, ${r.family}` : ''})"><i></i><span class="rn">${escapeHtml(r.name)}${r.kind !== 'house' ? `<em>${r.id === YOU ? 'you' : r.kind}</em>` : ''}</span><span class="rs">${Math.floor(r.score)}</span></div>`)
     .join('');
 
   g.cells.forEach((c, i) => {
@@ -513,7 +533,7 @@ function renderArena() {
 
   $('legend').innerHTML = [
     ...(mine ? [`<span><i class="sw sw-you"></i>You</span>`] : []),
-    ...shown.map((r) => `<span><i class="sw" style="--c:${r.color}"></i>${escapeHtml(r.name)}</span>`),
+    ...shown.map((r) => `<span><i class="sw" style="--c:${seatColor(g, r.id)}"></i>${escapeHtml(r.name)}</span>`),
     `<span><i class="sw sw-dud">✕</i>Dud</span>`,
     `<span><i class="sw sw-hz">⚠</i>Hazard</span>`,
   ].join('');
@@ -632,11 +652,15 @@ function openPicker() {
 }
 
 // ---------- overview ----------
+/**
+ * Size a canvas so its backing store maps 1:1 to device pixels (no resampling) and the
+ * 50x50 block uses whole-pixel cells with no leftover slack.
+ */
 function sizeCanvas(c: HTMLCanvasElement, css: number): Layout {
-  const dpr = Math.min(3, window.devicePixelRatio || 1);
-  const px = Math.round(css * dpr);
-  c.style.width = `${css}px`;
-  c.style.height = `${css}px`;
+  const dpr = window.devicePixelRatio || 1;
+  const px = fitPx(Math.floor(css * dpr));
+  c.style.width = `${px / dpr}px`;
+  c.style.height = `${px / dpr}px`;
   if (c.width !== px) { c.width = px; c.height = px; }
   return computeLayout(px);
 }
@@ -661,9 +685,9 @@ function fitClean() {
 
 function drawCanvases() {
   if (clean) {
-    drawOverview($<HTMLCanvasElement>('clean-canvas').getContext('2d')!, world, cleanLayout, { bg: art.bg, text: false, highlight: null });
+    drawOverview($<HTMLCanvasElement>('clean-canvas').getContext('2d')!, world, cleanLayout, { bg: art.bg, text: false, highlight: null, palette: pal });
   } else if (view === 'overview') {
-    drawOverview($<HTMLCanvasElement>('ov-canvas').getContext('2d')!, world, ovLayout, { bg: art.bg, text: art.labels, highlight: world.humanArena });
+    drawOverview($<HTMLCanvasElement>('ov-canvas').getContext('2d')!, world, ovLayout, { bg: art.bg, text: art.labels, highlight: world.humanArena, palette: pal });
   }
   ovDirty = false;
 }
@@ -700,10 +724,73 @@ function renderOverviewDom() {
 
   const lb = world.leaderboard();
   const row = (r: (typeof lb)[number]) =>
-    `<li class="${r.you ? 'me' : ''}"><span class="lr">${r.rank}</span><i style="background:${r.color}"></i><span class="ln">${escapeHtml(r.name)}</span><span class="la">${r.arena}</span><span class="ls">${r.score}</span></li>`;
+    `<li class="${r.you ? 'me' : ''}"><span class="lr">${r.rank}</span><i style="background:${seatColor(world.arenas[r.arenaIndex].game, r.seatId)}"></i><span class="ln">${escapeHtml(r.name)}</span><span class="la">${r.arena}</span><span class="ls">${r.score}</span></li>`;
   $('lb').innerHTML = lb.slice(0, 10).map(row).join('');
   const me = lb.find((r) => r.you);
   $('lb-you').innerHTML = me && me.rank > 10 ? `<ol class="lb-me">${row(me)}</ol>` : '';
+}
+
+// ---------- colours ----------
+type ColorTarget = 'heat' | 'you' | 's0' | 's1' | 's2' | 's3' | 'base' | 'dud' | 'hazard' | 'divider';
+const COLOR_TARGETS: { key: ColorTarget; label: string; def: string }[] = [
+  { key: 'heat', label: 'Probe heat', def: 'Spectrum' },
+  { key: 'you', label: 'Your squares', def: 'Default' },
+  { key: 's0', label: 'Seat 1', def: 'Bot colors' },
+  { key: 's1', label: 'Seat 2', def: 'Bot colors' },
+  { key: 's2', label: 'Seat 3', def: 'Bot colors' },
+  { key: 's3', label: 'Seat 4', def: 'Bot colors' },
+  { key: 'base', label: 'Unexplored', def: 'Default' },
+  { key: 'dud', label: 'Dud', def: 'Default' },
+  { key: 'hazard', label: 'Hazard', def: 'Default' },
+  { key: 'divider', label: 'Dividers', def: 'Background' },
+];
+const COLOR_PRESETS = [
+  '#3ee6ff', '#19f5b0', '#a6ff4d', '#ffe14d', '#ffb23f', '#ff6b4a', '#ff4fd8',
+  '#b18cff', '#5b7cff', '#ffffff', '#8a9a96', '#0b1b17', '#1a1033', '#000000',
+];
+let colorTarget: ColorTarget = 'heat';
+
+function getColor(t: ColorTarget): string | null {
+  if (t[0] === 's' && t.length === 2) return pal.seats[Number(t[1])];
+  return pal[t as 'heat' | 'you' | 'base' | 'dud' | 'hazard' | 'divider'];
+}
+function setColor(t: ColorTarget, v: string | null) {
+  if (t[0] === 's' && t.length === 2) pal.seats[Number(t[1])] = v;
+  else if (t === 'heat' || t === 'divider') pal[t] = v;
+  else (pal as unknown as Record<string, string>)[t] = v ?? (DEFAULT_PALETTE as unknown as Record<string, string>)[t];
+  pal = sanitizePalette(pal);
+  applyPalette();
+}
+/** Swatch preview for a target's current value (defaults get a pattern). */
+function preview(t: ColorTarget): string {
+  const v = getColor(t);
+  if (v) return v;
+  if (t === 'heat') return 'linear-gradient(90deg, hsl(180 95% 50%), hsl(100 95% 50%), hsl(45 95% 55%))';
+  if (t === 'divider') return art.bg;
+  return 'conic-gradient(#ff4fd8 0 25%, #ffb23f 0 50%, #a6ff4d 0 75%, #b18cff 0)';
+}
+function renderColors() {
+  $('ct-targets').innerHTML = COLOR_TARGETS.map((t) =>
+    `<button type="button" class="ctb${t.key === colorTarget ? ' on' : ''}" data-t="${t.key}"><i style="background:${preview(t.key)}"></i>${t.label}</button>`).join('');
+  const cur = getColor(colorTarget);
+  const def = COLOR_TARGETS.find((t) => t.key === colorTarget)!;
+  $('ct-palette').innerHTML =
+    `<button type="button" class="chip cdef${cur === null || cur === (DEFAULT_PALETTE as unknown as Record<string, unknown>)[colorTarget] ? ' on' : ''}" data-c="">${def.def}</button>` +
+    COLOR_PRESETS.map((c) => `<button type="button" class="swatch${cur === c ? ' on' : ''}" data-c="${c}" style="--sw:${c}" aria-label="${c}" title="${c}"></button>`).join('') +
+    `<label class="swatch custom${cur && !COLOR_PRESETS.includes(cur) ? ' on' : ''}" title="custom colour" aria-label="custom colour"><input type="color" id="ct-input" value="${cur ?? '#3ee6ff'}" /></label>`;
+  $('ct-hint').textContent = colorTarget[0] === 's' && colorTarget.length === 2
+    ? `Seat ${Number(colorTarget[1]) + 1} in every arena (your own seat keeps Your squares).`
+    : '';
+  $('ct-dots').innerHTML = ['heat', 'you', 's0', 's1', 's2', 's3'].map((k) => `<i style="background:${preview(k as ColorTarget)}"></i>`).join('');
+}
+function applyPalette() {
+  savePalette();
+  document.documentElement.style.setProperty('--youc', pal.you);
+  $('key-you').style.background = pal.you;
+  ovDirty = true;
+  renderColors();
+  if (view === 'arena') renderArena();
+  else renderOverviewDom();
 }
 
 function setSpeed(sp: number) {
@@ -720,6 +807,7 @@ function setBg(c: string) {
   ovDirty = true;
   renderOverviewDom();
   if (clean) $('clean').style.background = c;
+  renderColors();
 }
 
 let hintTimer = 0;
@@ -748,7 +836,7 @@ async function saveImage() {
   btn.disabled = true;
   try {
     const caption = art.labels ? `SUBSTRATE · round ${world.round} · ${world.phase === 'reveal' ? 'revealed' : `tick ${world.tick}/${world.maxTicks}`}` : undefined;
-    const blob = await renderPng(world, { bg: art.bg, text: art.labels, highlight: world.humanArena, caption }, 2048);
+    const blob = await renderPng(world, { bg: art.bg, text: art.labels, highlight: world.humanArena, caption, palette: pal }, 2048);
     const name = `substrate-r${world.round}-t${world.tick}.png`;
     const file = new File([blob], name, { type: 'image/png' });
     const nav = navigator as Navigator & { canShare?: (d: ShareData) => boolean };
@@ -828,6 +916,23 @@ $('ov-speed').addEventListener('click', (e) => {
 });
 $('ov-labels').addEventListener('click', () => { art.labels = !art.labels; savePrefs(); ovDirty = true; renderOverviewDom(); });
 $('ov-clean').addEventListener('click', enterClean);
+$('ct-targets').addEventListener('click', (e) => {
+  const b = (e.target as HTMLElement).closest<HTMLElement>('.ctb');
+  if (b?.dataset.t) { colorTarget = b.dataset.t as ColorTarget; renderColors(); }
+});
+$('ct-palette').addEventListener('click', (e) => {
+  const b = (e.target as HTMLElement).closest<HTMLElement>('button[data-c]');
+  if (b) setColor(colorTarget, b.dataset.c || null);
+});
+$('ct-palette').addEventListener('input', (e) => {
+  const t = e.target as HTMLInputElement;
+  if (t.id === 'ct-input') setColor(colorTarget, t.value);
+});
+$('ct-reset').addEventListener('click', () => {
+  pal = sanitizePalette({});
+  setBg(BG_PRESETS[0].color);
+  applyPalette();
+});
 $('ov-save').addEventListener('click', saveImage);
 $('ov-bg').addEventListener('click', (e) => {
   const b = (e.target as HTMLElement).closest<HTMLElement>('.swatch[data-bg]');
@@ -872,6 +977,7 @@ const startArena = (() => {
   return i >= 0 ? i : HOME_ARENA;
 })();
 newWorld(seedFromUrl() ?? randomSeed(), startArena);
+applyPalette();
 if (params.get('view') === 'map' || params.get('art') === '1' || startArena === null) showOverview();
 if (params.get('art') === '1') enterClean();
 if (!localStorage.getItem('substrate.seenHelp') && params.get('view') !== 'map' && params.get('art') !== '1') {
@@ -931,6 +1037,12 @@ const api = {
     else showArena(arena === undefined ? (world.humanArena ?? viewArena) : arenaIndex(arena));
   },
   setBackground: (c: string) => setBg(c),
+  /** Map colours: { heat, you, seats: [s1..s4], base, dud, hazard, divider } (null = default). Returns the palette. */
+  setColors(p?: Partial<Palette>) {
+    if (p) { pal = sanitizePalette({ ...pal, ...p }); applyPalette(); }
+    return pal;
+  },
+  resetColors() { pal = sanitizePalette({}); setBg(BG_PRESETS[0].color); applyPalette(); return pal; },
   saveImage,
   arenas: ARENA_COUNT,
   /** JS time of recent frames that ticked the sim and/or redrew the map. */
@@ -948,7 +1060,7 @@ const api = {
     const l = computeLayout(Math.round(cssPx * Math.min(3, window.devicePixelRatio || 1)));
     c.width = c.height = l.px;
     const ctx = c.getContext('2d')!;
-    for (let i = 0; i < n; i++) drawOverview(ctx, world, l, { bg: art.bg, text: true, highlight: world.humanArena });
+    for (let i = 0; i < n; i++) drawOverview(ctx, world, l, { bg: art.bg, text: true, highlight: world.humanArena, palette: pal });
     const t2 = performance.now();
     renderAll();
     return { stepMs: +((t1 - t0) / n).toFixed(2), drawMs: +((t2 - t1) / n).toFixed(2), canvasPx: l.px };
