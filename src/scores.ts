@@ -5,9 +5,12 @@ export interface ScoreEntry {
   seed: string;
   commit: string;
   date: string; // ISO
+  /** Arena id (A1..E5) and round the score was set in. Older records have neither. */
+  arena?: string;
+  round?: number;
 }
 
-const KEY = 'substrate.records.v1';
+const KEY = 'substrate.records.v1'; // same key: old single-table records stay on the board
 const HANDLE_KEY = 'substrate.handle';
 
 export function loadScores(): ScoreEntry[] {

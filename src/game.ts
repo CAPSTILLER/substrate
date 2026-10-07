@@ -45,28 +45,59 @@ export interface Zone {
 export type ZoneStatus = 'open' | 'owned' | 'dud' | 'hazard' | 'depleted';
 
 export interface Cell {
-  known: Range; // what YOU know about this zone's value
+  known: Range; // what YOU (the local human seat) know about this zone's value
   probes: number; // your direct probes on it
   hazardFlag: boolean; // your probes flagged it as unstable
   status: ZoneStatus;
-  owner: string | null; // 'you' or a rival id
+  owner: string | null; // seat id: 'you', a house bot id, or an agent id
   integrity: number; // 0..100 for owned zones
-  ping: string | null; // rival id that probed it this tick
+  ping: string | null; // house seat id that probed it this tick
 }
 
-export interface Rival {
+/**
+ * A seat at an arena table. 'house' seats are driven by the built-in AI and play
+ * by the house rules (no credits, no decay). 'human' and 'agent' seats play by the
+ * player rules (credits, decay, maintain) and are driven by the UI or the API.
+ * Live players / agents later replace house seats one for one.
+ */
+export type SeatKind = 'human' | 'house' | 'agent';
+
+export interface SeatDef {
   id: string;
+  kind: SeatKind;
   name: string;
   color: string;
+  /** House AI personality family (vex, orin, null, ...). */
+  family?: string;
+  actChance?: number;
+  greed?: number;
+  maxWidth?: number;
+}
+
+export interface Seat {
+  id: string;
+  kind: SeatKind;
+  name: string;
+  color: string;
+  family: string;
   score: number;
   zones: number;
+  credits: number;
+  probesUsed: number;
+  claimsMade: number;
   actChance: number;
   greed: number; // claim when estimated mid >= greed ...
   maxWidth: number; // ... and their range is at most this wide
   known: Range[];
   probes: number[];
   hazardKnown: boolean[];
+  /** Player seats only: busted before the round ended (round keeps going). */
+  out: boolean;
+  outReason: string;
 }
+
+/** Back-compat alias: rivals are just the other seats. */
+export type Rival = Seat;
 
 export interface LogEntry {
   tick: number;
@@ -81,11 +112,34 @@ export interface ActionResult {
   harvested?: number;
 }
 
+export type ActionKind = 'probe' | 'claim' | 'maintain' | 'wait';
+
+export const YOU = 'you';
+export const YOU_COLOR = '#3ee6ff';
+
 export const RIVAL_DEFS = [
   { id: 'vex', name: 'Vex-7', color: '#ff4fd8', actChance: 0.8, greed: 32, maxWidth: 36 },
   { id: 'orin', name: 'Orin', color: '#ffb23f', actChance: 0.8, greed: 40, maxWidth: 22 },
   { id: 'null', name: 'Null.Kid', color: '#a6ff4d', actChance: 0.8, greed: 36, maxWidth: 28 },
 ] as const;
+
+/** The original single-table line-up: you plus Vex-7, Orin and Null.Kid. */
+export const DEFAULT_SEATS: SeatDef[] = [
+  { id: YOU, kind: 'human', name: 'You', color: YOU_COLOR },
+  ...RIVAL_DEFS.map((d) => ({ ...d, family: d.id, kind: 'house' as const })),
+];
+
+export interface GameOptions {
+  seats?: SeatDef[];
+  /**
+   * Arena mode: the round always runs to maxTicks. A busted player seat is marked
+   * `out` instead of ending the game, and actions don't advance the clock
+   * (the World advances every arena together).
+   */
+  roundMode?: boolean;
+  /** Advance one tick after each tick-using action. Default: !roundMode. */
+  autoAdvance?: boolean;
+}
 
 const COLS = 'ABCDEFGHIJKLMNOP';
 export const idx = (x: number, y: number, size: number = CONFIG.size) => y * size + x;
@@ -188,41 +242,65 @@ export class Game {
   readonly commit: string;
   readonly map: Zone[];
   readonly cells: Cell[];
-  readonly rivals: Rival[];
+  readonly seats: Seat[];
+  readonly roundMode: boolean;
+  autoAdvance: boolean;
   tick = 0;
-  credits: number;
-  score = 0;
   over = false;
   endReason = '';
-  probesUsed = 0;
-  claimsMade = 0;
   log: LogEntry[] = [];
-  private probeRng: Rng;
+  private seatRngs = new Map<string, Rng>();
   private rivalRng: Rng;
 
-  constructor(seed: string, cfg: Config = CONFIG) {
+  constructor(seed: string, cfg: Config = CONFIG, opts: GameOptions = {}) {
     this.cfg = cfg;
     this.seed = seed;
+    this.roundMode = !!opts.roundMode;
+    this.autoAdvance = opts.autoAdvance ?? !this.roundMode;
     this.map = generateMap(seed, cfg);
     this.commit = commitHash(seed, this.map);
-    this.probeRng = makeRng(seed, 'probe');
     this.rivalRng = makeRng(seed, 'rivals');
-    this.credits = cfg.startCredits;
     const n = cfg.size * cfg.size;
     this.cells = Array.from({ length: n }, () => ({
       known: [0, 100] as Range, probes: 0, hazardFlag: false, status: 'open' as ZoneStatus,
       owner: null, integrity: 0, ping: null,
     }));
-    this.rivals = RIVAL_DEFS.map((d) => ({
-      ...d, score: 0, zones: 0,
-      known: Array.from({ length: n }, () => [0, 100] as Range),
-      probes: new Array(n).fill(0),
-      hazardKnown: new Array(n).fill(false),
-    }));
+    const defs = opts.seats ?? DEFAULT_SEATS;
+    if (new Set(defs.map((d) => d.id)).size !== defs.length) throw new Error('Seat ids must be unique');
+    this.seats = defs.map((d) => this.makeSeat(d));
     this.push('info', 'Scouts online. The substrate is sealed; read it before the rivals do.');
   }
 
   get size() { return this.cfg.size; }
+
+  private makeSeat(d: SeatDef): Seat {
+    const n = this.cfg.size * this.cfg.size;
+    return {
+      id: d.id, kind: d.kind, name: d.name, color: d.color, family: d.family ?? d.id,
+      score: 0, zones: 0, credits: this.cfg.startCredits, probesUsed: 0, claimsMade: 0,
+      actChance: d.actChance ?? 0.8, greed: d.greed ?? 36, maxWidth: d.maxWidth ?? 28,
+      known: Array.from({ length: n }, () => [0, 100] as Range),
+      probes: new Array(n).fill(0),
+      hazardKnown: new Array(n).fill(false),
+      out: false, outReason: '',
+    };
+  }
+
+  seat(id: string | null | undefined): Seat | undefined {
+    return id ? this.seats.find((s) => s.id === id) : undefined;
+  }
+  /** The local human seat, if one sits at this table. */
+  get you(): Seat | undefined { return this.seat(YOU); }
+  /** Every seat except the local human (house bots, other players, agents). */
+  get rivals(): Seat[] { return this.seats.filter((s) => s.id !== YOU); }
+
+  // Back-compat accessors for the local human seat.
+  get credits() { return this.you?.credits ?? 0; }
+  set credits(v: number) { if (this.you) this.you.credits = v; }
+  get score() { return this.you?.score ?? 0; }
+  set score(v: number) { if (this.you) this.you.score = v; }
+  get probesUsed() { return this.you?.probesUsed ?? 0; }
+  get claimsMade() { return this.you?.claimsMade ?? 0; }
 
   private push(kind: LogEntry['kind'], text: string) {
     this.log.push({ tick: this.tick, kind, text });
@@ -231,6 +309,31 @@ export class Game {
 
   private inBounds(x: number, y: number) {
     return Number.isInteger(x) && Number.isInteger(y) && x >= 0 && y >= 0 && x < this.size && y < this.size;
+  }
+
+  private rngFor(s: Seat): Rng {
+    let r = this.seatRngs.get(s.id);
+    if (!r) {
+      r = makeRng(this.seed, s.id === YOU ? 'probe' : `probe:${s.id}`);
+      this.seatRngs.set(s.id, r);
+    }
+    return r;
+  }
+
+  /** Mirror the local human seat's knowledge into `cells` (what the UI draws). */
+  private syncYou() {
+    const y = this.you;
+    this.cells.forEach((c, i) => {
+      c.known = y ? y.known[i] : [0, 100];
+      c.probes = y ? y.probes[i] : 0;
+      c.hazardFlag = y ? y.hazardKnown[i] : false;
+    });
+  }
+
+  /** A zone resolved in public (claimed / dud / hazard): everyone now knows it. */
+  private resolveKnown(i: number, r: Range) {
+    for (const s of this.seats) s.known[i] = r;
+    this.cells[i].known = r;
   }
 
   /** Apply a probe at (x,y) to a knowledge map: sharp reading there, fainter hints around it. */
@@ -249,121 +352,184 @@ export class Game {
     return known[i];
   }
 
-  ownedByYou(): number[] {
+  ownedBy(seatId: string): number[] {
     const out: number[] = [];
-    this.cells.forEach((c, i) => { if (c.owner === 'you') out.push(i); });
+    this.cells.forEach((c, i) => { if (c.owner === seatId) out.push(i); });
     return out;
   }
+  ownedByYou(): number[] { return this.ownedBy(YOU); }
 
-  probe(x: number, y: number): ActionResult {
+  /**
+   * Knowledge to draw for a viewer. With a seat id: that seat's own readings.
+   * Without: the intersection of every seat's readings (spectator / art view).
+   * Intersections are always valid because every reading contains the true value.
+   */
+  knowledge(seatId?: string): { known: Range[]; probes: number[]; hazard: boolean[] } {
+    const s = this.seat(seatId);
+    if (s) return { known: s.known, probes: s.probes, hazard: s.hazardKnown };
+    const n = this.cells.length;
+    const known: Range[] = new Array(n);
+    const probes: number[] = new Array(n).fill(0);
+    const hazard: boolean[] = new Array(n).fill(false);
+    for (let i = 0; i < n; i++) {
+      let lo = 0;
+      let hi = 100;
+      for (const st of this.seats) {
+        const k = st.known[i];
+        if (k[0] > lo) lo = k[0];
+        if (k[1] < hi) hi = k[1];
+        probes[i] += st.probes[i];
+        if (st.hazardKnown[i]) hazard[i] = true;
+      }
+      known[i] = [lo, Math.max(lo, hi)];
+    }
+    return { known, probes, hazard };
+  }
+
+  /** Generic action entry point for player seats (human or agent). */
+  act(seatId: string, kind: ActionKind, x = -1, y = -1): ActionResult {
     if (this.over) return { ok: false, message: 'Run is over.' };
+    const s = this.seat(seatId);
+    if (!s) return { ok: false, message: 'No such seat at this table.' };
+    if (s.kind === 'house') return { ok: false, message: 'House seats are driven by the house AI.' };
+    if (s.out) return { ok: false, message: `${s.id === YOU ? "You're" : `${s.name} is`} out for this round (${s.outReason.replace(/\.$/, '')}).` };
+    switch (kind) {
+      case 'probe': return this.doProbe(s, x, y);
+      case 'claim': return this.doClaim(s, x, y);
+      case 'maintain': return this.doMaintain(s, x, y);
+      case 'wait': return this.doWait(s);
+    }
+    return { ok: false, message: 'Unknown action.' };
+  }
+
+  probe(x: number, y: number): ActionResult { return this.act(YOU, 'probe', x, y); }
+  claim(x: number, y: number): ActionResult { return this.act(YOU, 'claim', x, y); }
+  /** Restore one of your zones to 100% integrity. Does not use a tick. */
+  maintain(x: number, y: number): ActionResult { return this.act(YOU, 'maintain', x, y); }
+  /** Let one tick pass without acting (yields still flow, rivals still move). */
+  endTurn(): ActionResult { return this.act(YOU, 'wait'); }
+
+  private say(s: Seat, kind: LogEntry['kind'], mine: string, theirs: string) {
+    if (s.id === YOU) this.push(kind, mine);
+    else this.push('rival', theirs);
+  }
+
+  private doProbe(s: Seat, x: number, y: number): ActionResult {
     if (!this.inBounds(x, y)) return { ok: false, message: 'Out of bounds.' };
     const i = idx(x, y, this.size);
-    const c = this.cells[i];
-    if (c.status !== 'open') return { ok: false, message: `${zoneLabel(x, y)} is already resolved.` };
-    if (this.credits < this.cfg.probeCost) return { ok: false, message: 'Not enough credits to probe.' };
-    this.credits -= this.cfg.probeCost;
-    this.probesUsed++;
-    const known = this.cells.map((cc) => cc.known);
-    const probes = this.cells.map((cc) => cc.probes);
-    const range = this.scan(known, probes, x, y, this.probeRng);
-    this.cells.forEach((cc, j) => { cc.known = known[j]; cc.probes = probes[j]; });
+    if (this.cells[i].status !== 'open') return { ok: false, message: `${zoneLabel(x, y)} is already resolved.` };
+    if (s.credits < this.cfg.probeCost) return { ok: false, message: 'Not enough credits to probe.' };
+    s.credits -= this.cfg.probeCost;
+    s.probesUsed++;
+    const rng = this.rngFor(s);
+    const range = this.scan(s.known, s.probes, x, y, rng);
     let msg = `Probed ${zoneLabel(x, y)}: signal ${range[0]}–${range[1]} (${signalWord(range)}).`;
-    if (this.map[i].hazard && !c.hazardFlag && this.probeRng() < this.cfg.hazardDetectChance) {
-      c.hazardFlag = true;
+    if (this.map[i].hazard && !s.hazardKnown[i] && rng() < this.cfg.hazardDetectChance) {
+      s.hazardKnown[i] = true;
       msg += ' ⚠ Unstable readings.';
     }
-    this.push('you', msg);
-    this.advance();
+    if (s.id === YOU) this.syncYou();
+    this.say(s, 'you', msg, `${s.name} probed ${zoneLabel(x, y)}.`);
+    this.afterTickAction();
     return { ok: true, message: msg, range };
   }
 
-  claim(x: number, y: number): ActionResult {
-    if (this.over) return { ok: false, message: 'Run is over.' };
+  private doClaim(s: Seat, x: number, y: number): ActionResult {
     if (!this.inBounds(x, y)) return { ok: false, message: 'Out of bounds.' };
     const i = idx(x, y, this.size);
     const c = this.cells[i];
     if (c.status !== 'open') return { ok: false, message: `${zoneLabel(x, y)} can't be claimed.` };
-    if (this.credits < this.cfg.claimCost) return { ok: false, message: 'Not enough credits to claim.' };
-    this.credits -= this.cfg.claimCost;
-    this.claimsMade++;
+    if (s.credits < this.cfg.claimCost) return { ok: false, message: 'Not enough credits to claim.' };
+    s.credits -= this.cfg.claimCost;
+    s.claimsMade++;
     const z = this.map[i];
+    const L = zoneLabel(x, y);
     let res: ActionResult;
     if (z.hazard) {
       c.status = 'hazard';
-      c.known = [0, 0];
-      this.credits = Math.max(0, this.credits - this.cfg.hazardPenalty);
-      res = { ok: true, message: `Hazard at ${zoneLabel(x, y)}! Stake lost and −${this.cfg.hazardPenalty} more.`, harvested: 0 };
-      this.push('bad', res.message);
+      this.resolveKnown(i, [0, 0]);
+      s.credits = Math.max(0, s.credits - this.cfg.hazardPenalty);
+      res = { ok: true, message: `Hazard at ${L}! Stake lost and −${this.cfg.hazardPenalty} more.`, harvested: 0 };
+      this.say(s, 'bad', res.message, `${s.name} hit a hazard at ${L}.`);
     } else if (z.value < this.cfg.claimThreshold) {
       c.status = 'dud';
-      c.known = [z.value, z.value];
-      res = { ok: true, message: `${zoneLabel(x, y)} was a dud (value ${z.value}). Stake lost.`, harvested: 0 };
-      this.push('bad', res.message);
+      this.resolveKnown(i, [z.value, z.value]);
+      res = { ok: true, message: `${L} was a dud (value ${z.value}). Stake lost.`, harvested: 0 };
+      this.say(s, 'bad', res.message, `${s.name} claimed a dud at ${L}.`);
     } else {
       const h = claimHarvest(z.value, this.cfg);
       c.status = 'owned';
-      c.owner = 'you';
+      c.owner = s.id;
       c.integrity = 100;
-      c.known = [z.value, z.value];
-      this.score = round1(this.score + h);
-      this.credits = round1(this.credits + h);
-      res = { ok: true, message: `Claimed ${zoneLabel(x, y)} (value ${z.value}). Harvested +${h}.`, harvested: h };
-      this.push('good', res.message);
+      s.zones++;
+      this.resolveKnown(i, [z.value, z.value]);
+      s.score = round1(s.score + h);
+      s.credits = round1(s.credits + h);
+      res = { ok: true, message: `Claimed ${L} (value ${z.value}). Harvested +${h}.`, harvested: h };
+      this.say(s, 'good', res.message, `${s.name} claimed ${L}.`);
     }
-    this.advance();
+    this.afterTickAction();
     return res;
   }
 
-  /** Restore one of your zones to 100% integrity. Does not use a tick. */
-  maintain(x: number, y: number): ActionResult {
-    if (this.over) return { ok: false, message: 'Run is over.' };
+  private doMaintain(s: Seat, x: number, y: number): ActionResult {
     if (!this.inBounds(x, y)) return { ok: false, message: 'Out of bounds.' };
     const c = this.cells[idx(x, y, this.size)];
-    if (c.owner !== 'you') return { ok: false, message: 'You can only maintain your own zones.' };
+    if (c.owner !== s.id) return { ok: false, message: 'You can only maintain your own zones.' };
     if (c.integrity >= 100) return { ok: false, message: 'Already at full integrity.' };
-    if (this.credits < this.cfg.maintainCost) return { ok: false, message: 'Not enough credits to maintain.' };
-    this.credits = round1(this.credits - this.cfg.maintainCost);
+    if (s.credits < this.cfg.maintainCost) return { ok: false, message: 'Not enough credits to maintain.' };
+    s.credits = round1(s.credits - this.cfg.maintainCost);
     c.integrity = 100;
     const msg = `Maintained ${zoneLabel(x, y)} back to 100%.`;
-    this.push('you', msg);
+    if (s.id === YOU) this.push('you', msg);
     return { ok: true, message: msg };
   }
 
-  /** Let one tick pass without acting (yields still flow, rivals still move). */
-  endTurn(): ActionResult {
-    if (this.over) return { ok: false, message: 'Run is over.' };
-    this.push('you', 'You hold position.');
-    this.advance();
+  private doWait(s: Seat): ActionResult {
+    if (s.id === YOU) this.push('you', 'You hold position.');
+    this.afterTickAction();
     return { ok: true, message: 'Tick passed.' };
   }
 
-  private advance() {
-    this.cells.forEach((c) => { c.ping = null; });
-    for (const r of this.rivals) this.rivalTurn(r);
+  private afterTickAction() {
+    if (this.autoAdvance) this.advance();
+  }
 
-    let yourYield = 0;
+  /**
+   * One clock tick for this table: house seats move, every owned zone yields,
+   * player zones decay, then end conditions are checked. In arena mode the
+   * World calls this on all 25 tables together.
+   */
+  advance() {
+    if (this.over) return;
+    this.cells.forEach((c) => { c.ping = null; });
+    for (const s of this.seats) if (s.kind === 'house') this.houseTurn(s);
+
+    const gained = new Map<Seat, number>();
     this.cells.forEach((c, i) => {
       if (c.status !== 'owned') return;
+      const s = this.seat(c.owner);
+      if (!s) return;
       const v = this.map[i].value;
-      if (c.owner === 'you') {
-        const y = tickYield(v, c.integrity, this.cfg);
-        yourYield += y;
-        c.integrity = decay(c.integrity, this.cfg);
-        if (c.integrity <= 0) {
-          c.status = 'depleted';
-          c.owner = null;
-          const { x, y: yy } = xyOf(i, this.size);
-          this.push('bad', `${zoneLabel(x, yy)} collapsed from decay.`);
-        }
-      } else {
-        const r = this.rivals.find((rr) => rr.id === c.owner);
-        if (r) r.score = round1(r.score + tickYield(v, 100, this.cfg));
+      if (s.kind === 'house') {
+        s.score = round1(s.score + tickYield(v, 100, this.cfg));
+        return;
+      }
+      gained.set(s, (gained.get(s) ?? 0) + tickYield(v, c.integrity, this.cfg));
+      c.integrity = decay(c.integrity, this.cfg);
+      if (c.integrity <= 0) {
+        c.status = 'depleted';
+        c.owner = null;
+        s.zones = Math.max(0, s.zones - 1);
+        const { x, y } = xyOf(i, this.size);
+        this.say(s, 'bad', `${zoneLabel(x, y)} collapsed from decay.`, `${s.name}'s ${zoneLabel(x, y)} collapsed.`);
       }
     });
-    if (yourYield > 0) {
-      this.score = round1(this.score + yourYield);
-      this.credits = round1(this.credits + yourYield);
+    for (const [s, y] of gained) {
+      if (y > 0) {
+        s.score = round1(s.score + y);
+        s.credits = round1(s.credits + y);
+      }
     }
     this.tick++;
     this.checkEnd();
@@ -372,17 +538,50 @@ export class Game {
   private checkEnd() {
     if (this.over) return;
     if (this.tick >= this.cfg.maxTicks) return this.finish('Signal window closed.');
-    if (this.credits < this.cfg.probeCost && this.ownedByYou().length === 0) return this.finish('Out of credits.');
-    if (!this.cells.some((c) => c.status === 'open') && this.ownedByYou().length === 0) return this.finish('Nothing left to scout.');
+    for (const s of this.seats) {
+      if (s.kind === 'house' || s.out) continue;
+      if (s.credits < this.cfg.probeCost && this.ownedBy(s.id).length === 0) {
+        if (!this.roundMode && s.id === YOU) return this.finish('Out of credits.');
+        s.out = true;
+        s.outReason = 'Out of credits.';
+        this.say(s, 'bad', 'Out of credits. The round keeps going without you.', `${s.name} is out of credits.`);
+      }
+    }
+    if (!this.roundMode && this.you && !this.cells.some((c) => c.status === 'open') && this.ownedByYou().length === 0) {
+      return this.finish('Nothing left to scout.');
+    }
   }
 
   private finish(reason: string) {
     this.over = true;
     this.endReason = reason;
-    this.push('info', `${reason} Final score ${Math.floor(this.score)}. Seed revealed: ${this.seed}.`);
+    const y = this.you;
+    this.push('info', y
+      ? `${reason} Final score ${Math.floor(y.score)}. Seed revealed: ${this.seed}.`
+      : `${reason} Seed revealed: ${this.seed}.`);
   }
 
-  private rivalTurn(r: Rival) {
+  /**
+   * Swap who sits in a seat (house bot -> human / agent, or back). The leaving
+   * occupant's zones collapse; the newcomer starts fresh with full credits.
+   */
+  replaceSeat(oldId: string, def: SeatDef): Seat {
+    const k = this.seats.findIndex((s) => s.id === oldId);
+    if (k < 0) throw new Error(`No seat ${oldId}`);
+    if (def.id !== oldId && this.seat(def.id)) throw new Error(`Seat id ${def.id} already taken`);
+    const old = this.seats[k];
+    this.cells.forEach((c) => {
+      if (c.owner === old.id) { c.owner = null; c.status = 'depleted'; c.integrity = 0; }
+    });
+    const seat = this.makeSeat(def);
+    this.seats[k] = seat;
+    this.seatRngs.delete(def.id);
+    this.syncYou();
+    this.push('info', def.id === YOU ? `You took ${old.name}'s seat.` : `${def.name} took ${old.name}'s seat.`);
+    return seat;
+  }
+
+  private houseTurn(r: Seat) {
     const rng = this.rivalRng;
     if (rng() > r.actChance) return;
     const n = this.cells.length;
@@ -400,13 +599,14 @@ export class Game {
       const { x, y } = xyOf(best, this.size);
       const c = this.cells[best];
       const z = this.map[best];
-      const youScouted = c.probes > 0;
+      const youScouted = (this.you?.probes[best] ?? 0) > 0;
       if (z.hazard) {
         c.status = 'hazard';
+        this.resolveKnown(best, [0, 0]);
         this.push('rival', `${r.name} hit a hazard at ${zoneLabel(x, y)}.`);
       } else if (z.value < this.cfg.claimThreshold) {
         c.status = 'dud';
-        c.known = [z.value, z.value];
+        this.resolveKnown(best, [z.value, z.value]);
         this.push('rival', `${r.name} claimed a dud at ${zoneLabel(x, y)}.`);
       } else {
         c.status = 'owned';
@@ -414,6 +614,7 @@ export class Game {
         c.integrity = 100;
         r.zones++;
         r.score = round1(r.score + claimHarvest(z.value, this.cfg));
+        this.resolveKnown(best, [z.value, z.value]);
         this.push('rival', youScouted
           ? `${r.name} sniped ${zoneLabel(x, y)} before you!`
           : `${r.name} claimed ${zoneLabel(x, y)}.`);
@@ -445,8 +646,9 @@ export class Game {
     this.cells[target].ping = r.id;
   }
 
-  /** JSON-friendly snapshot. Hidden values are only included once the run is over. */
+  /** JSON-friendly snapshot for the local human seat. Hidden values only once the round is over. */
   state() {
+    const y = this.you;
     return {
       seed: this.over ? this.seed : null,
       commit: this.commit,
@@ -456,6 +658,8 @@ export class Game {
       score: Math.floor(this.score * 10) / 10,
       over: this.over,
       endReason: this.endReason,
+      out: y ? y.out : false,
+      outReason: y ? y.outReason : '',
       costs: { probe: this.cfg.probeCost, claim: this.cfg.claimCost, maintain: this.cfg.maintainCost },
       rules: {
         size: this.size,
@@ -464,15 +668,42 @@ export class Game {
         yieldRate: this.cfg.yieldRate,
         claimHarvestRate: this.cfg.claimHarvestRate,
       },
-      rivals: this.rivals.map((r) => ({ id: r.id, name: r.name, score: Math.floor(r.score), zones: r.zones })),
+      rivals: this.rivals.map((r) => ({ id: r.id, kind: r.kind, name: r.name, score: Math.floor(r.score), zones: r.zones })),
+      zones: this.cells.map((c, i) => {
+        const { x, y: yy } = xyOf(i, this.size);
+        return {
+          x, y: yy, label: zoneLabel(x, yy), status: c.status, owner: c.owner,
+          range: c.known, probes: c.probes, hazardFlag: c.hazardFlag,
+          integrity: c.owner === YOU ? c.integrity : undefined,
+          rivalPing: c.ping,
+          value: this.over ? this.map[i].value : undefined,
+          hazard: this.over ? this.map[i].hazard : undefined,
+        };
+      }),
+      log: this.log.slice(-8),
+    };
+  }
+
+  /** Spectator snapshot: only public information (no seat's private readings). */
+  publicState() {
+    return {
+      seed: this.over ? this.seed : null,
+      commit: this.commit,
+      tick: this.tick,
+      maxTicks: this.cfg.maxTicks,
+      over: this.over,
+      endReason: this.endReason,
+      seats: this.seats.map((s) => ({
+        id: s.id, kind: s.kind, name: s.name, color: s.color, score: Math.floor(s.score), zones: s.zones,
+        out: s.out,
+      })),
       zones: this.cells.map((c, i) => {
         const { x, y } = xyOf(i, this.size);
         return {
           x, y, label: zoneLabel(x, y), status: c.status, owner: c.owner,
-          range: c.known, probes: c.probes, hazardFlag: c.hazardFlag,
-          integrity: c.owner === 'you' ? c.integrity : undefined,
+          integrity: c.status === 'owned' ? c.integrity : undefined,
           rivalPing: c.ping,
-          value: this.over ? this.map[i].value : undefined,
+          value: this.over || c.status !== 'open' ? this.map[i].value : undefined,
           hazard: this.over ? this.map[i].hazard : undefined,
         };
       }),
