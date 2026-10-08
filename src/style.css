@@ -44,6 +44,7 @@ code { font-family: var(--mono); }
   padding: 9px 12px; font-size: 14px; color: var(--text); min-height: 42px;
 }
 .ghost:active { background: var(--panel2); }
+.room-link { color: var(--accent); text-decoration: none; border-bottom: 1px dotted var(--accent); }
 .ghost.wide, .primary.wide { width: 100%; }
 .primary {
   background: var(--accent); color: #022; border: 0; border-radius: 10px; padding: 12px 16px;

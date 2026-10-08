@@ -23,7 +23,7 @@ app.innerHTML = `
 <header class="top">
   <div class="brand">
     <h1>SUBSTRATE</h1>
-    <span class="by">by CAPSTILLER</span>
+    <span class="by">by CAPSTILLER · <a class="room-link" href="/room.html">Room test</a></span>
   </div>
   <div class="top-actions">
     <button id="btn-help" class="ghost" type="button">How to play</button>
